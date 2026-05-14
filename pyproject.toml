@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "stdf-analyzer"
+version = "0.1.0"
+description = "Analyze bz2-compressed STDF (Standard Test Data Format) files"
+requires-python = ">=3.11"
+dependencies = [
+    "pystdf",
+]
+
+[project.scripts]
+stdf-analyzer = "analyze_stdf:main"
+
+[tool.setuptools.packages.find]
+include = ["stdf_analyzer*"]

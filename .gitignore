@@ -1,0 +1,4 @@
+*.bz2
+*.std
+__pycache__/
+*.pyc
