@@ -2,3 +2,5 @@
 *.std
 __pycache__/
 *.pyc
+dist_pyinstaller/
+stdf-analyzer
