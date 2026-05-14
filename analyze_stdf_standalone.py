@@ -4,13 +4,11 @@
 from __future__ import annotations
 
 import bz2
+import struct
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
-
-from pystdf import V4
-from pystdf.IO import Parser
 
 
 # ── models ──────────────────────────────────────────────────────────────────
@@ -85,145 +83,209 @@ class AnalysisResult:
     file_path: str = ""
 
 
-# ── parser ──────────────────────────────────────────────────────────────────
+# ── parser (custom tight-loop STDF reader) ──────────────────────────────────
 
-NEEDED_TYPES = [r for r in V4.records if r.__class__ in (
-    V4.Mir, V4.Mrr, V4.Pcr, V4.Sbr, V4.Hbr, V4.Pir, V4.Prr)]
+# STDF record types we care about
+_REC_MIR = (1, 10)
+_REC_MRR = (1, 20)
+_REC_PCR = (1, 30)
+_REC_HBR = (1, 40)
+_REC_SBR = (1, 50)
+_REC_PIR = (5, 10)
+_REC_PRR = (5, 20)
 
 
-def _to_dict(rec, fields):
-    return {k: v for (k, _), v in zip(rec.fieldMap, fields)}
+def _u1(buf, pos, end, endian, default=0):
+    return struct.unpack_from(endian + 'B', buf, pos)[0] if pos + 1 <= end else default
+
+def _u2(buf, pos, end, endian, default=0):
+    return struct.unpack_from(endian + 'H', buf, pos)[0] if pos + 2 <= end else default
+
+def _u4(buf, pos, end, endian, default=0):
+    return struct.unpack_from(endian + 'I', buf, pos)[0] if pos + 4 <= end else default
+
+def _cn(buf, pos, end, endian):
+    """Read Cn (variable string) if within bounds. Returns (value, new_pos)."""
+    if pos >= end:
+        return None, pos
+    slen = buf[pos]
+    pos += 1
+    if slen == 0 or pos + slen > end:
+        return None, pos
+    return buf[pos:pos + slen].decode('ascii', errors='replace'), pos + slen
 
 
-def _build_mir(raw: dict) -> MirData:
+def _parse_mir(buf, pos, end, endian):
+    """Parse MIR record, return MirData."""
+    setup_t = _u4(buf, pos, end, endian); pos += 4
+    start_t = _u4(buf, pos, end, endian); pos += 4
+    pos += 1  # STAT_NUM
+    pos += 1  # MODE_COD
+    pos += 1  # RTST_COD
+    pos += 1  # PROT_COD
+    pos += 2  # BURN_TIM
+    pos += 1  # CMOD_COD
+    lot_id, pos = _cn(buf, pos, end, endian)
+    part_type, pos = _cn(buf, pos, end, endian)
+    node_name, pos = _cn(buf, pos, end, endian)
+    tester_type, pos = _cn(buf, pos, end, endian)
+    job_name, pos = _cn(buf, pos, end, endian)
+    job_rev, pos = _cn(buf, pos, end, endian)
+    _, pos = _cn(buf, pos, end, endian)  # SBLOT_ID (skip)
+    operator_name, pos = _cn(buf, pos, end, endian)
+    exec_type, pos = _cn(buf, pos, end, endian)
+    _, pos = _cn(buf, pos, end, endian)  # EXEC_VER (skip)
+    _, pos = _cn(buf, pos, end, endian)  # TEST_COD (skip)
+    test_temp_raw, pos = _cn(buf, pos, end, endian)
+    user_text, pos = _cn(buf, pos, end, endian)
+    _, pos = _cn(buf, pos, end, endian)  # AUX_FILE (skip)
+    _, pos = _cn(buf, pos, end, endian)  # PKG_TYP (skip)
+    _, pos = _cn(buf, pos, end, endian)  # FAMLY_ID (skip)
+    _, pos = _cn(buf, pos, end, endian)  # DATE_COD (skip)
+    facility_id, pos = _cn(buf, pos, end, endian)
+    floor_id, pos = _cn(buf, pos, end, endian)
+
+    test_temp = test_temp_raw.strip() if test_temp_raw else None
+
     return MirData(
-        lot_id=raw.get("LOT_ID", ""),
-        part_type=raw.get("PART_TYP", ""),
-        job_name=raw.get("JOB_NAM", ""),
-        job_rev=raw.get("JOB_REV"),
-        tester_type=raw.get("TSTR_TYP", ""),
-        node_name=raw.get("NODE_NAM", ""),
-        operator_name=raw.get("OPER_NAM", ""),
-        test_temp=raw.get("TST_TEMP"),
-        facility_id=raw.get("FACIL_ID"),
-        floor_id=raw.get("FLOOR_ID"),
-        exec_type=raw.get("EXEC_TYP"),
-        user_text=raw.get("USER_TXT"),
-        start_t=raw.get("START_T"),
-        setup_t=raw.get("SETUP_T"),
+        lot_id=lot_id or "",
+        part_type=part_type or "",
+        job_name=job_name or "",
+        job_rev=job_rev,
+        tester_type=tester_type or "",
+        node_name=node_name or "",
+        operator_name=operator_name or "",
+        test_temp=test_temp,
+        facility_id=facility_id,
+        floor_id=floor_id,
+        exec_type=exec_type,
+        user_text=user_text,
+        start_t=start_t if start_t != 0 else None,
+        setup_t=setup_t if setup_t != 0 else None,
     )
 
 
-def _build_mrr(raw: dict) -> MrrData:
-    return MrrData(finish_t=raw.get("FINISH_T"))
+def _parse_mrr(buf, pos, end, endian):
+    """Parse MRR record, return MrrData."""
+    finish_t = _u4(buf, pos, end, endian)
+    return MrrData(finish_t=finish_t if finish_t != 0 else None)
 
 
-def _build_pcr(raw: dict) -> PcrData:
+def _parse_pcr(buf, pos, end, endian):
+    """Parse PCR record, return PcrData."""
+    head_num = _u1(buf, pos, end, endian); pos += 1
+    site_num = _u1(buf, pos, end, endian); pos += 1
+    part_cnt = _u4(buf, pos, end, endian); pos += 4
+    retest_cnt = _u4(buf, pos, end, endian, default=0); pos += 4
+    abort_cnt = _u4(buf, pos, end, endian, default=0); pos += 4
+    good_cnt = _u4(buf, pos, end, endian, default=0); pos += 4
+    func_cnt = _u4(buf, pos, end, endian, default=0); pos += 4
     return PcrData(
-        head_num=raw.get("HEAD_NUM"),
-        site_num=raw.get("SITE_NUM"),
-        part_cnt=raw.get("PART_CNT") or 0,
-        good_cnt=raw.get("GOOD_CNT") or 0,
-        func_cnt=raw.get("FUNC_CNT") or 0,
-        abort_cnt=raw.get("ABRT_CNT") or 0,
-        retest_cnt=raw.get("RTST_CNT") or 0,
+        head_num=head_num, site_num=site_num,
+        part_cnt=part_cnt, good_cnt=good_cnt,
+        func_cnt=func_cnt, abort_cnt=abort_cnt,
+        retest_cnt=retest_cnt,
     )
 
 
-def _build_sbr(raw: dict) -> SbrData:
-    return SbrData(
-        head_num=raw.get("HEAD_NUM"),
-        site_num=raw.get("SITE_NUM") or 0,
-        sbin_num=raw.get("SBIN_NUM") or 0,
-        sbin_cnt=raw.get("SBIN_CNT") or 0,
-        sbin_pf=raw.get("SBIN_PF"),
-        sbin_nam=(raw.get("SBIN_NAM") or "").strip() or None,
-    )
-
-
-def _build_hbr(raw: dict) -> HbrData:
+def _parse_hbr(buf, pos, end, endian):
+    """Parse HBR record, return HbrData."""
+    head_num = _u1(buf, pos, end, endian); pos += 1
+    site_num = _u1(buf, pos, end, endian); pos += 1
+    hbin_num = _u2(buf, pos, end, endian); pos += 2
+    hbin_cnt = _u4(buf, pos, end, endian); pos += 4
+    hbin_pf_raw = _u1(buf, pos, end, endian); pos += 1
+    hbin_nam, pos = _cn(buf, pos, end, endian)
     return HbrData(
-        head_num=raw.get("HEAD_NUM"),
-        site_num=raw.get("SITE_NUM") or 0,
-        hbin_num=raw.get("HBIN_NUM") or 0,
-        hbin_cnt=raw.get("HBIN_CNT") or 0,
-        hbin_pf=raw.get("HBIN_PF"),
-        hbin_nam=(raw.get("HBIN_NAM") or "").strip() or None,
+        head_num=head_num, site_num=site_num,
+        hbin_num=hbin_num, hbin_cnt=hbin_cnt,
+        hbin_pf=hbin_pf_raw if hbin_pf_raw != 0 else None,
+        hbin_nam=hbin_nam.strip() if hbin_nam else None,
     )
 
 
-class _Collector:
-    def __init__(self):
-        self.mir = None
-        self.mrr = None
-        self.pcr_list = []
-        self.sbr_list = []
-        self.hbr_list = []
-        self.pir_count = 0
-        self.prr_pass = 0
-        self.prr_fail = 0
-        self.prr_aborted = 0
-        self.soft_bins = {}
-        self.no_bin = 0
-        self.raw_mir = None
-
-    def after_send(self, ds, data):
-        rec_type, fields = data
-
-        if isinstance(rec_type, V4.Mir):
-            raw = _to_dict(rec_type, fields)
-            self.mir = _build_mir(raw)
-            self.raw_mir = raw
-        elif isinstance(rec_type, V4.Mrr):
-            raw = _to_dict(rec_type, fields)
-            self.mrr = _build_mrr(raw)
-        elif isinstance(rec_type, V4.Pcr):
-            raw = _to_dict(rec_type, fields)
-            self.pcr_list.append(_build_pcr(raw))
-        elif isinstance(rec_type, V4.Sbr):
-            raw = _to_dict(rec_type, fields)
-            self.sbr_list.append(_build_sbr(raw))
-        elif isinstance(rec_type, V4.Hbr):
-            raw = _to_dict(rec_type, fields)
-            self.hbr_list.append(_build_hbr(raw))
-        elif isinstance(rec_type, V4.Pir):
-            self.pir_count += 1
-        elif isinstance(rec_type, V4.Prr):
-            d = _to_dict(rec_type, fields)
-            if (d.get("PART_FLG", 0) & 1) == 0:
-                self.prr_pass += 1
-            else:
-                self.prr_fail += 1
-            if d.get("PART_FLG", 0) & 0x10:
-                self.prr_aborted += 1
-            sb = d.get("SOFT_BIN")
-            if sb is not None:
-                if sb == 65535:
-                    self.no_bin += 1
-                else:
-                    self.soft_bins[sb] = self.soft_bins.get(sb, 0) + 1
+def _parse_sbr(buf, pos, end, endian):
+    """Parse SBR record, return SbrData."""
+    head_num = _u1(buf, pos, end, endian); pos += 1
+    site_num = _u1(buf, pos, end, endian); pos += 1
+    sbin_num = _u2(buf, pos, end, endian); pos += 2
+    sbin_cnt = _u4(buf, pos, end, endian); pos += 4
+    sbin_pf_raw = _u1(buf, pos, end, endian); pos += 1
+    sbin_nam, pos = _cn(buf, pos, end, endian)
+    return SbrData(
+        head_num=head_num, site_num=site_num,
+        sbin_num=sbin_num, sbin_cnt=sbin_cnt,
+        sbin_pf=sbin_pf_raw if sbin_pf_raw != 0 else None,
+        sbin_nam=sbin_nam.strip() if sbin_nam else None,
+    )
 
 
 def parse_stdf_bz2(bz2_path: str):
-    collector = _Collector()
-
+    # Decompress entire file to memory
     with bz2.open(bz2_path, "rb") as f:
-        parser = Parser(recTypes=NEEDED_TYPES, inp=f)
-        parser.addSink(collector)
-        parser.parse()
+        buf = f.read()
+
+    # Detect endianness from FAR record (first record)
+    # FAR:  REC_TYP=0, REC_SUB=10, data has CPU_TYPE at offset 4
+    # CPU_TYPE 1=big, 2=little
+    far_cpu = buf[4] if len(buf) > 4 else 2
+    endian = '>' if far_cpu == 1 else '<'
+
+    pos = 0
+    n = len(buf)
+
+    mir = None
+    mrr = None
+    pcr_list = []
+    sbr_list = []
+    hbr_list = []
+    pir_count = 0
+    prr_pass = 0
+    prr_fail = 0
+    prr_aborted = 0
+    soft_bins: dict[int, int] = {}
+    no_bin = 0
+
+    while pos + 4 <= n:
+        rec_len, rec_typ, rec_sub = struct.unpack_from(endian + 'HBB', buf, pos)
+        pos += 4
+        data_end = pos + rec_len
+
+        key = (rec_typ, rec_sub)
+
+        if key == _REC_MIR:
+            mir = _parse_mir(buf, pos, data_end, endian)
+        elif key == _REC_MRR:
+            mrr = _parse_mrr(buf, pos, data_end, endian)
+        elif key == _REC_PCR:
+            pcr_list.append(_parse_pcr(buf, pos, data_end, endian))
+        elif key == _REC_HBR:
+            hbr_list.append(_parse_hbr(buf, pos, data_end, endian))
+        elif key == _REC_SBR:
+            sbr_list.append(_parse_sbr(buf, pos, data_end, endian))
+        elif key == _REC_PIR:
+            pir_count += 1
+        elif key == _REC_PRR:
+            # Only need PART_FLG and SOFT_BIN
+            part_flg_val = _u1(buf, pos + 2, data_end, endian, default=0)
+            if (part_flg_val & 1) == 0:
+                prr_pass += 1
+            else:
+                prr_fail += 1
+            if part_flg_val & 0x10:
+                prr_aborted += 1
+            sb_val = _u2(buf, pos + 6, data_end, endian, default=65535)
+            if sb_val == 65535:
+                no_bin += 1
+            else:
+                soft_bins[sb_val] = soft_bins.get(sb_val, 0) + 1
+
+        pos = data_end
 
     return (
-        collector.mir,
-        collector.mrr,
-        collector.pcr_list,
-        collector.sbr_list,
-        collector.hbr_list,
-        collector.pir_count,
-        collector.prr_pass,
-        collector.prr_fail,
-        collector.prr_aborted,
-        collector.soft_bins,
-        collector.no_bin,
+        mir, mrr, pcr_list, sbr_list, hbr_list,
+        pir_count, prr_pass, prr_fail, prr_aborted,
+        soft_bins, no_bin,
     )
 
 
