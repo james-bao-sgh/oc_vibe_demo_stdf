@@ -2,5 +2,6 @@
 *.std
 __pycache__/
 *.pyc
+*.pdf
 dist_pyinstaller/
 stdf-analyzer
