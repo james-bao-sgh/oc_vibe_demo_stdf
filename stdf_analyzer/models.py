@@ -57,6 +57,25 @@ class HbrData:
 
 
 @dataclass
+class TsrData:
+    head_num: Optional[int]
+    site_num: int
+    test_typ: str
+    test_num: int
+    exec_cnt: int
+    fail_cnt: int
+    alrm_cnt: int
+    test_nam: Optional[str]
+    seq_name: Optional[str]
+    test_lbl: Optional[str]
+    test_tim: Optional[float]
+    test_min: Optional[float]
+    test_max: Optional[float]
+    tst_sums: Optional[float]
+    tst_sqrs: Optional[float]
+
+
+@dataclass
 class AnalysisResult:
     mir: Optional[MirData]
     mrr: Optional[MrrData]
